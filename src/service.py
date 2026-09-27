@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ensure_role, normalize_severity,
+                     require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES,
+                    REVIEW_RECORD_KIND, REVIEW_RESULTS, REVIEW_ROLES,
+                    REVIEW_STATE, TITLE, VIEW_ROLES, completion_blockers,
+                    escalation_required, priority_score, response_deadline_hours,
+                    review_target, role_for_transition, validate_transition)
 
 
 class Service:
@@ -74,6 +76,36 @@ class Service:
                 item["severity"], item["quantity"], item["threshold"]),
         })
         return self.enrich(updated)
+
+    def submit_review(self, item_id: int, payload: Dict[str, Any], actor: str,
+                      role: str) -> Dict[str, Any]:
+        ensure_role(role, REVIEW_ROLES)
+        actor = require_text(actor, "actor", 100)
+        result = payload.get("result")
+        if result not in REVIEW_RESULTS:
+            raise ValueError("result必须是pass或fail")
+        opinion = require_text(payload.get("opinion"), "opinion")
+        expected_version = payload.get("expected_version")
+        if not isinstance(expected_version, int) or expected_version < 1:
+            raise ValueError("expected_version必须是正整数")
+        item = self.repository.get_item(item_id)
+        if item["status"] != REVIEW_STATE:
+            raise ConflictError("当前状态不允许提交复查结论")
+        target = review_target(result)
+        blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+        if blockers:
+            raise ConflictError("；".join(blockers))
+        outcome = self.repository.submit_review(
+            item_id, result, opinion, target, expected_version, actor,
+            REVIEW_RECORD_KIND)
+        detail: Dict[str, Any] = {
+            "from": item["status"], "to": target, "result": result,
+            "opinion": opinion, "version": outcome["item"]["version"],
+        }
+        if outcome["record"] is not None:
+            detail["record_id"] = outcome["record"]["id"]
+        self.repository.append_audit("review", ENTITY, item_id, actor, detail)
+        return {"item": self.enrich(outcome["item"]), "record": outcome["record"]}
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)

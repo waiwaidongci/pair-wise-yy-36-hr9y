@@ -30,6 +30,7 @@ python3 app.py --db ./data.db --port 8313
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/review`，负责人（director）在执法检查阶段提交复查结论：`result`（`pass`/`fail`）、`opinion`（复查意见）和`expected_version`。`pass`时事件关闭，`fail`时事件回到整改阶段并自动生成一条待整改事项；结论、状态和版本号在同一事务内生效，过期版本返回409。
 - `GET /api/audit`
 
 允许角色：operator, compliance_officer, director, viewer。按浓度与许可限值计算超标倍数，异常读数先进入评估；关闭前必须没有未完成整改项。

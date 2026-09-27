@@ -38,7 +38,11 @@ class Repository:
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    review_result TEXT CHECK(review_result IN ('pass','fail')),
+                    review_opinion TEXT,
+                    review_by TEXT,
+                    review_at TEXT
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_items_external_ref
                     ON items(external_ref) WHERE external_ref IS NOT NULL;
@@ -66,6 +70,15 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        with self._lock, self.conn:
+            columns = {row["name"] for row in
+                       self.conn.execute("PRAGMA table_info(items)").fetchall()}
+            for column in ("review_result", "review_opinion", "review_by", "review_at"):
+                if column not in columns:
+                    self.conn.execute(f"ALTER TABLE items ADD COLUMN {column} TEXT")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -122,6 +135,33 @@ class Repository:
                     raise NotFoundError("项目不存在")
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
+
+    def submit_review(self, item_id: int, result: str, opinion: str, target: str,
+                      expected_version: int, actor: str,
+                      record_kind: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE items SET status=?, version=version+1, updated_at=?,
+                   review_result=?, review_opinion=?, review_by=?, review_at=?
+                   WHERE id=? AND version=?""",
+                (target, now, result, opinion, actor, now, item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("项目不存在")
+                raise ConflictError("版本冲突，请刷新后重试")
+            record = None
+            if target != "closed":
+                cur = self.conn.execute(
+                    """INSERT INTO records(item_id, kind, detail, status, external_ref,
+                       created_by, created_at) VALUES(?,?,?,?,NULL,?,?)""",
+                    (item_id, record_kind, f"复查不通过：{opinion}", "open", actor, now),
+                )
+                record = dict(self.conn.execute(
+                    "SELECT * FROM records WHERE id=?", (int(cur.lastrowid),)).fetchone())
+        return {"item": self.get_item(item_id), "record": record}
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
