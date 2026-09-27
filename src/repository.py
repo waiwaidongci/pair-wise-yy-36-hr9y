@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, REVIEW_FROM_STATE, STATES, completion_blockers
 
 
 class Repository:
@@ -53,6 +53,15 @@ class Repository:
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    result TEXT NOT NULL CHECK(result IN ('pass','fail')),
+                    opinion TEXT NOT NULL,
+                    item_version INTEGER NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +132,54 @@ class Repository:
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
 
+    def apply_review(self, item_id: int, result: str, opinion: str, target: str,
+                     expected_version: int, actor: str,
+                     follow_up: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT status FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("项目不存在")
+            if row["status"] != REVIEW_FROM_STATE:
+                raise ConflictError(f"当前状态{row['status']}不能提交复查结论")
+            blockers = completion_blockers(target, self.open_record_count(item_id))
+            if blockers:
+                raise ConflictError("；".join(blockers))
+            cur = self.conn.execute(
+                """UPDATE items SET status=?, version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (target, now, item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("版本冲突，请刷新后重试")
+            new_version = expected_version + 1
+            cur = self.conn.execute(
+                """INSERT INTO reviews(item_id, result, opinion, item_version,
+                   created_by, created_at) VALUES(?,?,?,?,?,?)""",
+                (item_id, result, opinion, new_version, actor, now),
+            )
+            review_id = int(cur.lastrowid)
+            follow_up_id = None
+            if follow_up is not None:
+                cur = self.conn.execute(
+                    """INSERT INTO records(item_id, kind, detail, status, external_ref,
+                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
+                    (item_id, follow_up["kind"], follow_up["detail"], "open", None,
+                     actor, now),
+                )
+                follow_up_id = int(cur.lastrowid)
+        review = {"id": review_id, "item_id": item_id, "result": result,
+                  "opinion": opinion, "item_version": new_version,
+                  "created_by": actor, "created_at": now}
+        record = None
+        if follow_up_id is not None:
+            with self._lock:
+                row = self.conn.execute(
+                    "SELECT * FROM records WHERE id=?", (follow_up_id,)).fetchone()
+            record = dict(row)
+        return {"item": self.get_item(item_id), "review": review, "follow_up": record}
+
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
         now = utc_now()
@@ -146,6 +203,14 @@ class Repository:
         with self._lock:
             rows = self.conn.execute(
                 "SELECT * FROM records WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_reviews(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM reviews WHERE item_id=? ORDER BY id", (item_id,)
             ).fetchall()
         return [dict(row) for row in rows]
 

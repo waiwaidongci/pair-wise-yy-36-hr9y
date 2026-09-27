@@ -30,9 +30,11 @@ python3 app.py --db ./data.db --port 8313
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/review`，负责人提交复查结论（`result`为`pass`或`fail`，附`opinion`与`expected_version`）
+- `GET /api/items/{id}/reviews`
 - `GET /api/audit`
 
-允许角色：operator, compliance_officer, director, viewer。按浓度与许可限值计算超标倍数，异常读数先进入评估；关闭前必须没有未完成整改项。
+允许角色：operator, compliance_officer, director, viewer。按浓度与许可限值计算超标倍数，异常读数先进入评估；关闭前必须没有未完成整改项。复查不通过时事件回到整改阶段并生成一条待整改事项，复查通过则关闭；复查意见、事件状态和版本号在同一事务中生效，过期版本提交会被拒绝。
 
 ## 测试
 

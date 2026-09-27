@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ensure_role, normalize_severity,
+                     require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES,
+                    REVIEW_FROM_STATE, REVIEW_ROLES, TITLE, VIEW_ROLES,
+                    completion_blockers, escalation_required, priority_score,
+                    response_deadline_hours, review_target, role_for_transition,
                     validate_transition)
 
 
@@ -65,7 +67,6 @@ class Service:
             raise ValueError("expected_version必须是正整数")
         blockers = completion_blockers(target, self.repository.open_record_count(item_id))
         if blockers:
-            from .domain import ConflictError
             raise ConflictError("；".join(blockers))
         updated = self.repository.transition_item(item_id, target, expected_version, actor)
         self.repository.append_audit("transition", ENTITY, item_id, actor, {
@@ -74,6 +75,38 @@ class Service:
                 item["severity"], item["quantity"], item["threshold"]),
         })
         return self.enrich(updated)
+
+    def submit_review(self, item_id: int, payload: Dict[str, Any], actor: str,
+                      role: str) -> Dict[str, Any]:
+        ensure_role(role, REVIEW_ROLES)
+        actor = require_text(actor, "actor", 100)
+        result = payload.get("result")
+        target = review_target(result)
+        opinion = require_text(payload.get("opinion"), "opinion")
+        expected_version = payload.get("expected_version")
+        if not isinstance(expected_version, int) or expected_version < 1:
+            raise ValueError("expected_version必须是正整数")
+        item = self.repository.get_item(item_id)
+        if item["status"] != REVIEW_FROM_STATE:
+            raise ConflictError(f"当前状态{item['status']}不能提交复查结论")
+        follow_up = None
+        if result == "fail":
+            follow_up = {"kind": "rectification",
+                         "detail": f"复查不通过待整改：{opinion}"}
+        outcome = self.repository.apply_review(
+            item_id, result, opinion, target, expected_version, actor, follow_up)
+        review = outcome["review"]
+        follow = outcome["follow_up"]
+        self.repository.append_audit("review", ENTITY, item_id, actor, {
+            "result": result, "opinion": opinion, "from": REVIEW_FROM_STATE,
+            "to": target, "version": review["item_version"],
+            "follow_up_record_id": follow["id"] if follow else None,
+        })
+        enriched = self.enrich(outcome["item"])
+        enriched["review"] = review
+        if follow is not None:
+            enriched["follow_up_record"] = follow
+        return enriched
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
@@ -86,6 +119,10 @@ class Service:
     def list_records(self, item_id: int, role: str) -> list:
         self._view(role)
         return self.repository.list_records(item_id)
+
+    def list_reviews(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_reviews(item_id)
 
     def audit(self, role: str, item_id: Optional[int] = None) -> list:
         ensure_role(role, AUDIT_ROLES)
